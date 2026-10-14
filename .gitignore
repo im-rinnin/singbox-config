@@ -1,0 +1,13 @@
+# Local secrets and deployment state
+/key
+/runtime/
+/private/
+*.plain.json
+*.json.tmp
+
+# Workflow and local temporary data
+.pi/
+
+# Build outputs
+*.tar
+*.tar.gz

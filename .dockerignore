@@ -1,0 +1,10 @@
+key
+runtime
+private
+.pi
+.git
+*.plain.json
+*.json.tmp
+README.md
+readme.md
+agents.md

@@ -1,0 +1,254 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SERVICE_NAME=${SINGBOX_SERVICE_NAME:-singbox-service}
+IMAGE=${SINGBOX_IMAGE:-singbox-service:local}
+SERVICE_DIR=${SINGBOX_SERVICE_DIR:-$ROOT_DIR/runtime}
+PASSWORD_FILE=${SINGBOX_PASSWORD_FILE:-$ROOT_DIR/key}
+PROFILE_DIR=$SERVICE_DIR/profile
+ACTIVE_PROFILE_FILE=$PROFILE_DIR/active.profile
+DATA_DIR=$SERVICE_DIR/data
+BACKUP_DIR=$SERVICE_DIR/backups
+HTTP_HOST_PORT=${SINGBOX_HTTP_HOST_PORT:-7890}
+DNS_HOST_PORT=${SINGBOX_DNS_HOST_PORT:-53}
+BIND_ADDRESS=${SINGBOX_BIND_ADDRESS:-0.0.0.0}
+HEALTHCHECK_HOST=${SINGBOX_HEALTHCHECK_HOST:-127.0.0.1}
+HEALTHCHECK_URL=${SINGBOX_HTTP_HEALTHCHECK_URL:-https://cp.cloudflare.com/generate_204}
+
+absolute_path() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$(pwd)" "$1" ;;
+    esac
+}
+
+PASSWORD_FILE=$(absolute_path "$PASSWORD_FILE")
+PROFILE_DIR=$(absolute_path "$PROFILE_DIR")
+ACTIVE_PROFILE_FILE=$(absolute_path "$ACTIVE_PROFILE_FILE")
+DATA_DIR=$(absolute_path "$DATA_DIR")
+BACKUP_DIR=$(absolute_path "$BACKUP_DIR")
+
+fail() {
+    printf '%s\n' "singbox-service: $*" >&2
+    exit 1
+}
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || fail "docker is required"
+}
+
+ensure_layout() {
+    mkdir -p "$SERVICE_DIR" "$PROFILE_DIR" "$DATA_DIR" "$BACKUP_DIR"
+    chmod 0700 "$SERVICE_DIR" "$PROFILE_DIR" "$DATA_DIR" "$BACKUP_DIR"
+    [ -r "$PASSWORD_FILE" ] || fail "password file is missing: $PASSWORD_FILE"
+    if [ ! -s "$ACTIVE_PROFILE_FILE" ]; then
+        tmp=$(mktemp "$PROFILE_DIR/active.profile.XXXXXX")
+        printf '%s\n' "main-http-dns" > "$tmp"
+        chmod 0600 "$tmp"
+        mv -f "$tmp" "$ACTIVE_PROFILE_FILE"
+    fi
+}
+
+current_profile() {
+    [ -r "$ACTIVE_PROFILE_FILE" ] || fail "active profile is missing"
+    profile=$(tr -d '\r\n' < "$ACTIVE_PROFILE_FILE")
+    case "$profile" in
+        ''|*[!A-Za-z0-9._-]*) fail "invalid active profile" ;;
+    esac
+    printf '%s\n' "$profile"
+}
+
+container_exists() {
+    docker container inspect "$SERVICE_NAME" >/dev/null 2>&1
+}
+
+container_running() {
+    [ "$(docker inspect --format '{{.State.Running}}' "$SERVICE_NAME" 2>/dev/null || true)" = true ]
+}
+
+check_profile() {
+    profile=$1
+    require_docker
+    docker run --rm \
+        --read-only \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --tmpfs /run/singbox:rw,noexec,nosuid,nodev \
+        --mount "type=bind,src=$PASSWORD_FILE,dst=/run/secrets/singbox-config-password,readonly" \
+        --entrypoint /usr/local/bin/singbox-entrypoint \
+        -e "SINGBOX_PROFILE=$profile" \
+        "$IMAGE" check
+}
+
+start_container() {
+    require_docker
+    ensure_layout
+    check_profile "$(current_profile)"
+    if container_exists; then
+        if container_running; then
+            wait_ready || fail "container is not healthy"
+            return 0
+        fi
+        docker start "$SERVICE_NAME" >/dev/null
+        wait_ready || fail "container did not become healthy"
+        return 0
+    fi
+
+    docker run --detach \
+        --name "$SERVICE_NAME" \
+        --restart unless-stopped \
+        --read-only \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges:true \
+        --tmpfs /run/singbox:rw,noexec,nosuid,nodev \
+        --tmpfs /tmp:rw,noexec,nosuid,nodev \
+        --mount "type=bind,src=$PASSWORD_FILE,dst=/run/secrets/singbox-config-password,readonly" \
+        --mount "type=bind,src=$PROFILE_DIR,dst=/run/profile,readonly" \
+        --mount "type=bind,src=$DATA_DIR,dst=/var/lib/singbox" \
+        --publish "$BIND_ADDRESS:$HTTP_HOST_PORT:7890/tcp" \
+        --publish "$BIND_ADDRESS:$DNS_HOST_PORT:5353/tcp" \
+        --publish "$BIND_ADDRESS:$DNS_HOST_PORT:5353/udp" \
+        "$IMAGE" run >/dev/null
+    wait_ready || fail "container did not become healthy"
+}
+
+restart_container() {
+    require_docker
+    if container_exists; then
+        docker restart "$SERVICE_NAME" >/dev/null
+        wait_ready || fail "container did not become healthy"
+    else
+        start_container
+    fi
+}
+
+check_http() {
+    command -v curl >/dev/null 2>&1 || fail "curl is required for the HTTP health check"
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --noproxy '' \
+        --connect-timeout 3 \
+        --max-time 15 \
+        --proxy "http://$HEALTHCHECK_HOST:$HTTP_HOST_PORT" \
+        "$HEALTHCHECK_URL" \
+        --output /dev/null
+}
+
+wait_ready() {
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        if container_running && check_http >/dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    return 1
+}
+
+switch_profile() {
+    target=$1
+    ensure_layout
+    check_profile "$target"
+    old=$(current_profile)
+    if [ "$old" = "$target" ]; then
+        printf '%s\n' "profile already active: $target"
+        return 0
+    fi
+    backup=$(mktemp "$BACKUP_DIR/active.profile.XXXXXX")
+    cp -p "$ACTIVE_PROFILE_FILE" "$backup"
+    tmp=$(mktemp "$PROFILE_DIR/active.profile.XXXXXX")
+    printf '%s\n' "$target" > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$ACTIVE_PROFILE_FILE"
+    if container_exists && ! docker restart "$SERVICE_NAME" >/dev/null 2>&1; then
+        cp -p "$backup" "$ACTIVE_PROFILE_FILE"
+        docker restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fail "profile switch failed; restored $old"
+    fi
+    if container_exists && ! wait_ready; then
+        cp -p "$backup" "$ACTIVE_PROFILE_FILE"
+        docker restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+        wait_ready >/dev/null 2>&1 || true
+        fail "profile did not become healthy; restored $old"
+    fi
+    printf '%s\n' "active profile: $target"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: singbox-service <command> [profile]
+
+Commands:
+  init       Initialize the runtime directory and active profile
+  up         Create or start the container
+  down       Stop the container
+  restart    Restart the container
+  status     Show the active profile and container state
+  logs       Follow container logs
+  list       List encrypted profiles in the image
+  current    Print the active profile name
+  check      Validate the active or specified profile
+  use NAME   Validate and activate a profile
+EOF
+}
+
+command=${1:-}
+case "$command" in
+    init)
+        ensure_layout
+        printf '%s\n' "initialized $SERVICE_DIR"
+        ;;
+    up)
+        start_container
+        printf '%s\n' "started $SERVICE_NAME with $(current_profile)"
+        ;;
+    down)
+        require_docker
+        if container_exists; then docker stop "$SERVICE_NAME" >/dev/null; fi
+        ;;
+    restart)
+        restart_container
+        printf '%s\n' "restarted $SERVICE_NAME"
+        ;;
+    status)
+        ensure_layout
+        printf 'profile=%s\n' "$(current_profile)"
+        if container_exists; then
+            docker inspect --format 'container={{.Name}} running={{.State.Running}} image={{.Config.Image}}' "$SERVICE_NAME"
+        else
+            printf '%s\n' 'container=absent'
+        fi
+        ;;
+    logs)
+        require_docker
+        exec docker logs --follow "$SERVICE_NAME"
+        ;;
+    list)
+        require_docker
+        docker run --rm --read-only --entrypoint /usr/local/bin/singbox-entrypoint "$IMAGE" list
+        ;;
+    current)
+        ensure_layout
+        current_profile
+        ;;
+    check)
+        ensure_layout
+        check_profile "${2:-$(current_profile)}"
+        printf '%s\n' 'configuration is valid'
+        ;;
+    use)
+        [ $# -eq 2 ] || fail 'use requires a profile name'
+        switch_profile "$2"
+        ;;
+    ''|-h|--help|help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
